@@ -1,110 +1,173 @@
 #
-# GHCI Management
+# GHCI Containers
 #
-# This workflow manages the GitHub CI infrastructure. It does not execute the
-# CI, but instead builds the required containers, prepares the infrastructure,
-# and deploys required services.
+# This workflow manages the GitHub-CI containers. On every commit it builds the
+# ghci containers. On special branch/tag names, it pushes the container out to
+# Github Packages and `quay.io`.
 #
 
-name: "GHCI Management"
+name: "GHCI Containers"
 
-on:
-  pull_request:
-    branches:
-    - "ghci/**"
-  push:
-    branches:
-    - "ghci/**"
-    tags:
-    - "ghci/**"
+on: [pull_request, push]
 
 jobs:
   #
-  # Create Containers
+  # Enumerate Containers
   #
-  # This job builds and optionally pushes containers from `./ghci/containers/`
-  # to github-packages. Depending on the source ref, a different operation is
-  # performed:
+  # This job runs `make ghci-list` and provides this output as JSON array
+  # to other jobs. This allows us to dynamically react to additions to the
+  # GHCI container list and create new jobs for each container.
   #
-  #   * `refs/*/ghci/abc/xyz`: If a ref with name `ghci/abc/xyz` is pushed,
-  #     the container `abc` is built with tag-name `xyz`.
-  #
-  #   * `refs/*/ghci/all/xyz`: This is a special case of the previous one which
-  #     builds all containers.
-  #
-  #   * `refs/*/ghci/abc/rcXYZ`: This is a special case which pushes containers
-  #     out to the registries, whenever their tag starts with `rc*`.
-  #
-  #   * In all other cases, the containers are built but immediately discarded.
-  #
-  create_containers:
-    name: "Create Containers"
+  enumerate:
+    name: "Enumerate Containers"
     runs-on: ubuntu-latest
+    outputs:
+      containers: ${{ steps.enumerate.outputs.containers }}
     steps:
+    - name: "Clone Repository"
+      uses: actions/checkout@v2
+    - name: "Enumerate Containers"
+      id: enumerate
+      run: |
+        CONTAINERS="$(make ghci-list | jq -Rc '[.]' | jq -sc '[.[][0]]')"
+        echo "::set-output name=containers::${CONTAINERS}"
+    - name: "ECHO"
+      run: echo "${{ steps.enumerate.outputs.containers }}"
+
+  #
+  # Build/Push Containers
+  #
+  # This builds containers and pushes them to the GitHub Packages registry.
+  # Furthermore, all images are also mirrored on `quay.io` if the branch is
+  # on the `osbuild/containers` repository.
+  #
+  # By default, all images are built. If the branch is `master`, they are
+  # pushed as `latest`. If the branch is `ghci/c/<name>`, then only the
+  # container `<name>` is built and pushed (with tag `latest`).
+  #
+  # If the branch is `ghci/rc/<tag>` then all images are built with `<tag>`
+  # as tag and pushed out. An alias with `commit-<sha>` is pushed as well.
+  #
+  build:
+    name: "Build/Push Container"
+    runs-on: ubuntu-latest
+    needs: enumerate
+    strategy:
+      fail-fast: false
+      matrix:
+        container: ${{ fromJson(needs.enumerate.outputs.containers) }}
+    steps:
+    - name: "Clone Repository"
+      uses: actions/checkout@v2
+    - name: "Authenticate to GitHub Packages"
+      run: docker login docker.pkg.github.com -u "${{ github.actor }}" -p "${{ github.token }}"
+
       #
       # Job Variables
       #
       # This step sets some output variables for use in later steps. See each
       # variable for details.
       #
-      #     ${{ steps.vars.outputs.PUSH }}
-      #         Whether to push images or not (`true` or `false`).
+      #     ${{ steps.vars.outputs. }}
+      #         .
       #
-      #     ${{ steps.vars.outputs.GROUP }}
-      #         If the ref-name matches `a/b`, this is set to `a`.
+      #     ${{ steps.vars.outputs.SKIP }}
+      #         Whether to skip this container.
       #
       #     ${{ steps.vars.outputs.TAG }}
-      #         If the ref-name matches `a/b`, this is set to `b`.
+      #         The tag to use for this image.
       #
     - name: "Job Variables"
       id: vars
       env:
-        ENV_GITHUB_REF: ${{ github.ref }}
-        ENV_GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_REF: ${{ github.ref }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
       run: |
-        if [[ "${ENV_GITHUB_REF}" =~ ^refs/[^/]+/ghci/[^/]+/[^/]+$ ]] ; then
-          GROUP=$(echo "${ENV_GITHUB_REF}" | sed -e 's|.*/.*/.*/\(.*\)/.*|\1|')
-          TAG=$(echo "${ENV_GITHUB_REF}" | sed -e 's|.*/.*/.*/.*/\(.*\)|\1|')
-        else
-          GROUP="all"
+        GROUP=""
+        NAME=""
+        if [[ "${GITHUB_REF}" =~ ^refs/[^/]+/ghci/[^/]+/[^/]+$ ]] ; then
+          GROUP=$(echo "${GITHUB_REF}" | sed -e 's|.*/.*/.*/\(.*\)/.*|\1|')
+          NAME=$(echo "${GITHUB_REF}" | sed -e 's|.*/.*/.*/.*/\(.*\)|\1|')
+        elif [[ "${GITHUB_REF}" =~ ^refs/[^/]+/ghci/[^/]+$ ]] ; then
+          GROUP=$(echo "${GITHUB_REF}" | sed -e 's|.*/.*/.*/\(.*\)|\1|')
+        fi
+
+        BUILD="true"
+        PUSH="true"
+        RELEASE="false"
+        TAG="latest"
+        if [[ "${GITHUB_REF}" = "refs/heads/master" ]] ; then
           TAG="latest"
+        elif [[ "${GROUP}" = "latest" ]] ; then
+          TAG="latest"
+        elif [[ "${GROUP}" = "rc" ]] ; then
+          TAG="rc"
+        elif [[ "${GROUP}" =~ "^v" ]] ; then
+          BUILD="false"
+          RELEASE="true"
+          TAG="${GROUP}"
+        else
+          PUSH="false"
         fi
 
-        PUSH="false"
-        if [[ "${ENV_GITHUB_REPOSITORY}" = "osbuild/containers" \
-              && "${TAG}" =~ ^rc ]] ; then
-          PUSH="true"
+        SKIP="false"
+        if [[ "${NAME}" != "" && "${NAME}" != "${{ matrix.container }}" ]] ; then
+          SKIP="true"
         fi
 
+        MIRROR="false"
+        if [[ "${GITHUB_REPOSITORY}" = "osbuild/containers" ]] ; then
+          MIRROR="true"
+        fi
+
+        echo "::set-output name=BUILD::${BUILD}"
+        echo "::set-output name=MIRROR::${MIRROR}"
         echo "::set-output name=PUSH::${PUSH}"
-        echo "::set-output name=GROUP::${GROUP}"
+        echo "::set-output name=RELEASE::${RELEASE}"
+        echo "::set-output name=SKIP::${SKIP}"
         echo "::set-output name=TAG::${TAG}"
     - name: "Print Variables"
       run: |
+        echo "BUILD: ${{ steps.vars.outputs.BUILD }}"
+        echo "MIRROR: ${{ steps.vars.outputs.MIRROR }}"
         echo "PUSH: ${{ steps.vars.outputs.PUSH }}"
-        echo "GROUP: ${{ steps.vars.outputs.GROUP }}"
+        echo "RELEASE: ${{ steps.vars.outputs.RELEASE }}"
+        echo "SKIP: ${{ steps.vars.outputs.SKIP }}"
         echo "TAG: ${{ steps.vars.outputs.TAG }}"
 
-    - name: "Clone Repository"
-      uses: actions/checkout@v2
-    - name: "Authenticate to GitHub Packages"
-      run: docker login docker.pkg.github.com -u "${{ github.actor }}" -p "${{ github.token }}"
-
     - name: "Build and Push Containers"
+      if: ${{ steps.vars.outputs.BUILD == 'true' && steps.vars.outputs.SKIP == 'false' }}
       run: |
         make \
           "GHCI_PUSH=${{ steps.vars.outputs.PUSH }}" \
           "GHCI_REPOSITORY=${{ github.repository }}" \
           "GHCI_TAG=${{ steps.vars.outputs.TAG }}" \
-          "ghci-create-${{ steps.vars.outputs.GROUP }}"
+          "ghci-create-${{ matrix.container }}"
+
+    - name: "Release Containers"
+      if: ${{ steps.vars.outputs.RELEASE == 'true' && steps.vars.outputs.SKIP == 'false' }}
+      run: |
+        make \
+          "GHCI_ALIAS_TAG=commit-${{ github.sha }}" \
+          "GHCI_PUSH=true" \
+          "GHCI_REPOSITORY=${{ github.repository }}" \
+          "GHCI_TAG=rc" \
+          "ghci-alias-${{ matrix.container }}"
+        make \
+          "GHCI_ALIAS_TAG=${{ steps.vars.outputs.TAG }}" \
+          "GHCI_PUSH=true" \
+          "GHCI_REPOSITORY=${{ github.repository }}" \
+          "GHCI_TAG=rc" \
+          "ghci-alias-${{ matrix.container }}"
 
     - name: "Mirror Containers on Quay.io"
-      if: ${{ steps.vars.outputs.PUSH == 'true' }}
+      if: ${{ steps.vars.outputs.MIRROR == 'true' && steps.vars.outputs.SKIP == 'false' }}
       run: |
         docker login quay.io -u "osbuild+github_actions" -p "${{ secrets.QUAY_TOKEN }}"
         make \
           "GHCI_ALIAS_REGISTRY=quay.io" \
           "GHCI_ALIAS_REPOSITORY=osbuild" \
           "GHCI_PUSH=true" \
+          "GHCI_REPOSITORY=${{ github.repository }}" \
           "GHCI_TAG=${{ steps.vars.outputs.TAG }}" \
-          "ghci-alias-${{ steps.vars.outputs.GROUP }}"
+          "ghci-alias-${{ matrix.container }}"

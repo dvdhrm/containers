@@ -152,3 +152,7 @@ $(GHCI_CONTAINERS_ALIAS): ghci-alias-%: x-alias/$(GHCI_REGISTRY)/$(GHCI_REPOSITO
 .PHONY: ghci-create ghci-create-all $(GHCI_CONTAINERS_CREATE)
 ghci-create ghci-create-all: $(GHCI_CONTAINERS_CREATE)
 $(GHCI_CONTAINERS_CREATE): ghci-create-%: x-create/$(GHCI_REGISTRY)/$(GHCI_REPOSITORY)/%
+
+.PHONY: ghci-list
+ghci-list:
+	@for c in $(GHCI_CONTAINERS) ; do echo "$${c}" ; done
